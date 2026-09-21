@@ -1,0 +1,23 @@
+version: "3.8"
+services:
+  laya-jev-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - API_KEY=sk-laya-local-001
+      # 离线模式：指定本地模型路径
+      # - MODEL_PATH=/app/model
+    restart: unless-stopped
+    # 离线挂载方式（不打包进镜像，外部挂载模型目录，镜像体积更小）
+    # volumes:
+    #   - ./model:/app/model
