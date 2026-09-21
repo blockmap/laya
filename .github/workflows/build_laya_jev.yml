@@ -19,11 +19,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - name: Increase disk space
-        uses: actions/setup-disk@v1
-        with:
-          size: 50 # GB，模型+镜像非常大，至少50G
-          
+      # - name: Increase disk space
+      #   uses: actions/setup-disk@v1
+      #   with:
+      #     size: 50 # GB，模型+镜像非常大，至少50G
+
       - name: Clean docker image cache
         shell: bash
         # if: ${{ github.repository == 'luoweb/inference' }}
