@@ -12,7 +12,7 @@ env:
   DOCKER_TAG: cuda12.0
   HF_MODEL_REPO: ConvAI/Laya
   HF_TOKEN: ${{ secrets.HF_TOKEN }} # 私有模型需要，公模可以不填
-  GHCR_REPO: ${{ github.repository_owner }}/${{ github.repository }}
+  GHCR_REPO: ${{ github.repository }}
 
 jobs:
   build:
