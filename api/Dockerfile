@@ -23,7 +23,7 @@ ENV HF_HUB_ENABLE_HF_TRANSFER=1
 ARG HF_TOKEN
 
 # 构建期烘焙模型（默认关闭保持镜像轻量；运行时 laya.py 会自动回退下载）
-ARG DOWNLOAD_MODEL=false
+ARG DOWNLOAD_MODEL=true
 ARG MODEL_REPO=convaiinnovations/laya-multilingual
 RUN if [ "$DOWNLOAD_MODEL" = "true" ]; then \
       python3 -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ['MODEL_REPO'], local_dir='/app/model', token=os.environ.get('HF_TOKEN'))"; \

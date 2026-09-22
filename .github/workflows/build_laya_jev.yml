@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch: # 支持手动点击触发
+    inputs:
+      download_model:
+        description: "构建期把模型烘焙进镜像（true=镜像自包含可离线运行，体积大；false=保持轻量，运行时自动下载）"
+        required: false
+        default: true
+        type: boolean
 
 env:
   DOCKER_IMAGE_NAME: laya-jev-api
@@ -67,6 +73,7 @@ jobs:
           tags: ghcr.io/${{ env.GHCR_REPO }}:${{ env.DOCKER_TAG }}
           build-args: |
             HF_TOKEN=${{ env.HF_TOKEN }}
+            DOWNLOAD_MODEL=${{ inputs.download_model || 'false' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -80,6 +87,7 @@ jobs:
           tags: ${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_TAG }}
           build-args: |
             HF_TOKEN=${{ env.HF_TOKEN }}
+            DOWNLOAD_MODEL=${{ inputs.download_model || 'false' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
