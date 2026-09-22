@@ -1,23 +1,41 @@
 version: "3.8"
+
 services:
   laya-jev-api:
+    container_name: laya-jev-api
     build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # ========== GPU模式（需要nvidia-docker，取消下面deploy注释启用；CPU环境保持注释） ==========
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
     environment:
       - API_KEY=sk-laya-local-001
-      # 离线模式：指定本地模型路径
+      # 模型下载鉴权用（私有仓库需要，公开模型可不填）
+      - HF_TOKEN=${HF_TOKEN:-}
+      # 离线模式：指定本地模型路径，启用时取消注释
       # - MODEL_PATH=/app/model
     restart: unless-stopped
-    # 离线挂载方式（不打包进镜像，外部挂载模型目录，镜像体积更小）
+    # 离线挂载模型目录（外部挂载，减小镜像体积，启用时取消注释）
     # volumes:
     #   - ./model:/app/model
+    # 可选：日志滚动，防止日志占满磁盘
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+    # 可选健康检查，确认服务就绪
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

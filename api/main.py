@@ -1,5 +1,6 @@
 # main.py
 import os
+import sys
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, Union
@@ -9,7 +10,11 @@ app = FastAPI(title="Laya Jev-Compatible API")
 API_KEY = os.getenv("API_KEY", "sk-laya-local-001")
 
 # 全局加载 agent，服务启动一次性加载
-agent = laya.load("convaiinnovations/laya-multilingual")
+try:
+    agent = laya.load("convaiinnovations/laya-multilingual")
+except Exception as e:
+    print(f"[FATAL] Failed to load Laya model: {e}", file=sys.stderr)
+    sys.exit(1)
 
 # ---------------- Pydantic Schema ----------------
 class NoulQuestion(BaseModel):

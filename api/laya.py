@@ -118,16 +118,51 @@ class LayaAgent:
 def load(model_ref: str) -> LayaAgent:
     """
     laya.load("convaiinnovations/laya-multilingual")
-    优先读取环境变量MODEL_PATH，若本地路径存在直接加载；
-    模型ref仅作为标识，离线场景忽略huggingface下载
+    优先加载本地MODEL_PATH；若模型缺失则自动从HuggingFace下载；
+    下载失败（或HF_HUB_OFFLINE=1）时抛出带修复指引的RuntimeError
     """
     MODEL_PATH = os.getenv("MODEL_PATH", "/app/model")
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     TORCH_DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 
-    # 离线校验模型文件
     config_file = os.path.join(MODEL_PATH, "config.json")
     if not os.path.exists(config_file):
-        raise RuntimeError(f"Model missing at {MODEL_PATH}, expect config.json. ref={model_ref}")
+        _download_model(model_ref, MODEL_PATH, config_file)
 
     return LayaAgent(MODEL_PATH, DEVICE, TORCH_DTYPE)
+
+
+def _download_model(model_ref: str, model_path: str, config_file: str) -> None:
+    """模型本地缺失时从HuggingFace下载到MODEL_PATH，并给出可执行的修复指引"""
+    if os.environ.get("HF_HUB_OFFLINE") == "1":
+        raise RuntimeError(_missing_model_msg(model_ref, model_path, "HF_HUB_OFFLINE=1 已设置（离线模式），不会尝试联网下载。"))
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        os.makedirs(model_path, exist_ok=True)
+        snapshot_download(
+            repo_id=model_ref,
+            local_dir=model_path,
+            token=os.environ.get("HF_TOKEN"),
+        )
+    except Exception as e:
+        raise RuntimeError(_missing_model_msg(model_ref, model_path, f"自动下载失败: {e}")) from e
+
+    if not os.path.exists(config_file):
+        raise RuntimeError(
+            f"Downloaded {model_ref} to {model_path}, but {config_file} still missing. "
+            "The repo layout may not match a transformers model."
+        )
+
+
+def _missing_model_msg(model_ref: str, model_path: str, reason: str) -> str:
+    return (
+        f"Model missing at {model_path}, expect config.json. ref={model_ref}. {reason}\n"
+        "Fix options:\n"
+        "  1) 给容器联网权限，启动时自动从HuggingFace下载（公开模型无需HF_TOKEN）\n"
+        "  2) 私有仓库模型：设置环境变量 HF_TOKEN 后重启\n"
+        "  3) 离线部署：宿主机先把模型放到 ./model/，并取消docker-compose.yaml中 "
+        "volumes 的 `- ./model:/app/model` 注释\n"
+        "  4) 构建期烘焙模型到镜像：docker build --build-arg DOWNLOAD_MODEL=true"
+    )
