@@ -1,0 +1,28 @@
+api/Dockerfile
+  h_492b42777c8bc9 26
+.github/workflows/build_laya_jev.yml
+  s_6c34811037177c::t_68a2c7eb94b7b8 9-11,14
+  h_492b42777c8bc9 12-13
+  s_6c34811037177c::t_ad52c4c829b783 76,90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8ba27c0c342bf7a28ebe365896851640ab953737",
+  "prompts": {},
+  "humans": {
+    "h_492b42777c8bc9": {
+      "author": "Robin <luoweb@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_6c34811037177c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f36a6c9ceffeHekIrOYksQEweV",
+        "model": "big-pickle"
+      },
+      "human_author": "Robin <luoweb@users.noreply.github.com>"
+    }
+  }
+}
