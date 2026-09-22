@@ -1,0 +1,31 @@
+api/laya.py
+  s_6c34811037177c::t_40d2a41ff5d825 121-122,130,133-168
+api/main.py
+  s_6c34811037177c::t_f770d06ca947e6 3,13-17
+api/Dockerfile
+  s_6c34811037177c::t_d0c6f6779d1393 20-21,25-32
+api/docker-compose.yaml
+  h_492b42777c8bc9 2,5,11-18,23,26,29-41
+  s_6c34811037177c::t_9ad03c31b081f5 21-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a71f65f529dfecf85ef8d35b64f7fd27572fe0f7",
+  "prompts": {},
+  "humans": {
+    "h_492b42777c8bc9": {
+      "author": "Robin <luoweb@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_6c34811037177c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f36a6c9ceffeHekIrOYksQEweV",
+        "model": "big-pickle"
+      },
+      "human_author": "Robin <luoweb@users.noreply.github.com>"
+    }
+  }
+}
