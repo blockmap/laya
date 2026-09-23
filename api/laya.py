@@ -125,7 +125,7 @@ def load(model_ref: str) -> LayaAgent:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     TORCH_DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 
-    config_file = os.path.join(MODEL_PATH, "config.json")
+    config_file = os.path.join(MODEL_PATH, "encoder/config.json")
     if not os.path.exists(config_file):
         _download_model(model_ref, MODEL_PATH, config_file)
 

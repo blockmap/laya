@@ -1,0 +1,7 @@
+# 缩小构建上下文：本地模型目录等大体积/无关文件不进入 build context
+model/
+__pycache__/
+*.pyc
+.git
+Dockerfile.bk
+*.md
