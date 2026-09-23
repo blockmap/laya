@@ -1,0 +1,19 @@
+api/requirements.txt
+  s_e2baeeeeb765e8::t_d611317fb668db 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "765999b917c9e7b3ff4cf96bfe7e57a69d480540",
+  "prompts": {},
+  "sessions": {
+    "s_e2baeeeeb765e8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f3129d4e2ffeqLPd645rf8Kcxo",
+        "model": "big-pickle"
+      },
+      "human_author": "Robin <luoweb@users.noreply.github.com>"
+    }
+  }
+}
