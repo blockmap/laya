@@ -17,13 +17,25 @@ env:
   TOKENIZERS_PARALLELISM: "false"
 
 jobs:
+  feishu-benchmark:
+    name: Chinese benchmark audit (no models or API)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python research/benchmarks/feishu_zh/audit.py
+      - run: python -m unittest discover -s research/benchmarks/feishu_zh/tests -v
+
   test:
     name: tests (py${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.13"]
+        # Keep this in lockstep with pyproject classifiers; packaging tests enforce that.
+        python: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -49,6 +61,15 @@ jobs:
           python tests/test_shortlist.py
           python tests/test_decision_model.py
           python tests/test_packaging.py
+          python tests/test_lang_guess.py
+          python tests/test_calibration_persistence.py
+          python tests/test_context_manager.py
+          python tests/test_criteria_normalization.py
+          python tests/test_docker_entrypoint.py
+          python tests/test_empty_questions.py
+          python tests/test_router_memory.py
+          python tests/test_shortlist_cosine.py
+          python tests/test_temperature_loading.py
 
       - name: Email cleaning tests
         run: python tests/test_email.py

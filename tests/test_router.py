@@ -3,6 +3,7 @@ import sys
 import os
 import threading
 import time as _time
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -116,6 +117,36 @@ check("latin_lang/long english stays en",
                            "we have been waiting for three days and nobody has replied to us"), "en")
 
 
+# --------------------------------------------------------------------- dotted tokens (#177)
+# `com` is Portuguese ("with") and `o` is its article, and `_WORD` splits `github.com` into
+# `github` + `com`, so every domain in a state scored a Portuguese hit: two of them crossed the
+# margin and sent an English state with links in it to the multilingual checkpoint, reported as
+# Portuguese. A token whose dot or @ joins word characters is an identifier, not prose.
+_r_dotted = Router()
+for label, state in [
+    ("url and email fields", {"url": "github.com", "email": "user@acme.com"}),
+    ("two bare domains", "github.com acme.com"),
+    ("link list", {"links": ["example.com", "example.co.uk", "docs.readthedocs.io"]}),
+]:
+    check("latin_lang/dotted " + label, analyse(state)["language"], None)
+    check("is_english/dotted " + label, is_english(state), True)
+    check("route/dotted " + label, _r_dotted.route(state).model, "english")
+# versions, decimals and dotted abbreviations are identifiers too, and were never prose
+for text, label in [("build 1.2.3 on 12.30 with ratio 0.5", "version and decimal"),
+                    ("Report by Smith et al., e.g. the U.S.A. office", "dotted abbreviation")]:
+    check("is_english/dotted " + label, is_english(text), True)
+    check("route/dotted " + label, _r_dotted.route(text).model, "english")
+# masking identifiers must not cost the prose around them its language, and a full stop ends a
+# sentence rather than joining an identifier: the word before it keeps its letters.
+check("latin_lang/portuguese prose with a link",
+      guess_latin_language("O cliente nao recebeu o produto, mas quer o dinheiro para a conta, "
+                           "veja example.com"), "pt")
+check("latin_lang/portuguese sentence with a full stop",
+      guess_latin_language("O cliente nao recebeu o produto, mas quer o dinheiro para a conta."), "pt")
+check("route/english with a link stays english",
+      _r_dotted.route({"body": "Please check example.com and acme.com for the invoice"}).model, "english")
+
+
 # --------------------------------------------------------------------- state flattening
 check("state_text/dict", "charged twice" in state_text({"body": "charged twice", "n": 3}), True)
 check("state_text/nested", "deep" in state_text({"a": {"b": ["deep"]}}), True)
@@ -194,6 +225,16 @@ check("route/auto ON but generic questions",
 # explicit model still beats auto-detected workflow
 check("route/explicit beats workflow",
       r_auto.route({"body": "x"}, Q_TD, model="multilingual")["model"], "multilingual")
+# An auto-detected workflow reports `repo` like every other branch does. It used to hand back the raw
+# (repo, subfolder) spec, which serialises to a JSON list instead of the "repo/subfolder" string.
+check("route/auto workflow repo is a string",
+      r_auto.route({"body": "I was charged twice"}, Q_TD)["repo"], "convaiinnovations/laya/typed-decisions")
+check("route/auto workflow repo matches explicit task",
+      r_auto.route({"body": "I was charged twice"}, Q_TD)["repo"],
+      r_auto.route({"body": "I was charged twice"}, Q_TD, task="typed_decisions")["repo"])
+check("route/auto workflow repo standalone",
+      Router(auto_task_detection=True, standalone_repos=True).route({"body": "x"}, Q_TD)["repo"],
+      "convaiinnovations/laya-typed-decisions")
 
 # decision payload shape
 d = r.route({"body": "मुझसे दो बार शुल्क लिया गया"}, Q_GENERIC)
@@ -223,6 +264,117 @@ check("route/undecided reason mentions letters",
 check("route/english still english",
       _r_lat.route("Please refund the duplicate charge on invoice 4411 today.").model, "english")
 check("route/short english still english", _r_lat.route("refund me").model, "english")
+
+# Undecided Latin text follows `default`, as a state with no letters already did. Short messages made
+# only of content words carry nothing that names their language, and hard-coding English for them
+# sent every short Portuguese message to the checkpoint that is 0.97 confident at 0.47 accuracy on
+# `pt`, whatever the router was configured with.
+_r_ml = Router(default="multilingual")
+for text in ["Quero cancelar", "Esqueci minha senha", "Fui cobrado duas vezes",
+             "Produto veio quebrado, quero trocar", "refund me"]:
+    check("route/undecided follows default " + text[:24], _r_ml.route(text).model, "multilingual")
+    check("route/undecided stock default " + text[:24], _r_lat.route(text).model, "english")
+check("route/undecided reason names the default",
+      "using default (multilingual)" in _r_ml.route("Esqueci minha senha").reason, True)
+# identified English is not undecided, so a non-English default leaves it alone
+for text in ["Please refund the duplicate charge", "Please refund the duplicate charge on invoice 4411 today."]:
+    check("route/identified english ignores default " + text[:24], _r_ml.route(text).model, "english")
+check("route/english reason unchanged",
+      _r_lat.route("Please refund the duplicate charge on invoice 4411 today.").reason, "English Latin text")
+
+
+# --------------------------------------------------------------------- plain-ASCII Romance (#172)
+# A state that lost its accents carries no diacritic rate for the non-English signal to read, and
+# mail clients and ticket systems strip them routinely, so the function-word lists are the only
+# evidence left. Spanish and Italian complaints were reported `is_english=True` and handed to the
+# English checkpoint -- the one that collapses off English -- while the accented spelling of the
+# same text reached multilingual. The lists for fr/es/pt/it held mostly accented words (`está`,
+# `más`, `è`, `être`, `não`) plus a handful of unaccented ones, so a stripped state matched one
+# word or none and fell under the two-hit margin below.
+for lang, text in [
+    ("es", "El pedido llego roto y nadie responde cuando escribo al soporte"),
+    ("es", "Quiero cancelar mi plan y pedir un reembolso"),
+    ("es", "La factura tiene un error en el importe total"),
+    ("es", "Necesito que me devuelvan el dinero de la compra duplicada"),
+    ("it", "Il cliente e stato addebitato due volte e vuole un rimborso"),
+    ("it", "Voglio cancellare il mio abbonamento e chiedere un rimborso"),
+    ("it", "La fattura contiene un errore nell importo totale"),
+    ("pt", "O cliente foi cobrado duas vezes e quer o dinheiro de volta"),
+    ("fr", "Le client a ete facture deux fois et demande un remboursement"),
+    ("fr", "Je ne peux pas acceder a mon compte et j ai besoin d aide"),
+]:
+    check("latin_lang/plain ascii " + lang + " " + text[:32], guess_latin_language(text), lang)
+    check("is_english/plain ascii " + lang + " " + text[:32], is_english(text), False)
+    check("route/plain ascii " + lang + " " + text[:32], _r_lat.route(text).model, "multilingual")
+# the accented spellings must keep working: those route on the diacritic rate
+for lang, text in [
+    ("es", "La facturación tiene un error y necesito una corrección urgente"),
+    ("it", "La fattura è sbagliata, devo avere un rimborso per il pagamento"),
+    ("fr", "La commande est arrivée cassée et personne ne répond au support"),
+]:
+    check("route/accented " + lang, _r_lat.route(text).model, "multilingual")
+
+# English must not move for this. The added words are ordinary English tokens as well -- `de facto`,
+# `et al.`, `e.g.`, `la carte`, `UN`, `MI5`, `DOS` -- and a state carrying none of them is the case
+# that has to keep routing to English.
+for text in [
+    "The customer was charged twice and wants a refund for this invoice",
+    "Please cancel my subscription and refund the duplicate charge today",
+    "The report by Smith et al. shows the de facto standard, e.g. the LA office and Rio",
+    "Our MI5 and UN contacts discussed the DOS attack in LA last month",
+    "No refund was issued, so I am writing to you again about invoice 4411",
+    "no refund no reply",
+    "The son of the director filed a complaint about the duplicate invoice",
+]:
+    check("is_english/romance control " + text[:32], is_english(text), True)
+    check("route/romance control " + text[:32], _r_lat.route(text).model, "english")
+
+# A word several lists claim (`la`, `e`, `o`) says "not English" without saying *which* language, so
+# it may not name one on its own -- the same rule as the 0-0 tie above, which is why the sample
+# below still names nothing even though `la` and `e` now count for Italian: it routes to multilingual
+# on the Romanian diacritic, not on a guessed language.
+check("latin_lang/shared words alone name nothing",
+      analyse("Cât e ora acum la Tokyo")["language"], None)
+check("route/shared words still multilingual",
+      _r_lat.route("Cât e ora acum la Tokyo").model, "multilingual")
+# ...but a distinctive word in the same state is enough to name the language it belongs to.
+check("latin_lang/distinctive word names the language",
+      guess_latin_language("La fattura contiene un errore nell importo totale"), "it")
+check("latin_lang/shared hits still count toward a named language",
+      guess_latin_language("La factura tiene un error en el importe total"), "es")
+
+
+# --------------------------------------------------------------------- Brazilian support text
+# Short Brazilian messages lean on `você`/`vc`, the unaccented `nao`/`voce` and `gostaria`, none of
+# which the `pt` list held, so each matched one word, fell under the two-hit margin and went to the
+# English checkpoint -- which on `pt` reports 0.97 mean confidence at 0.47 accuracy (ECE 0.51).
+for text in [
+    "Boa tarde, gostaria de cancelar o plano",
+    "Voce pode me mandar a nota fiscal?",
+    "Você pode me mandar a nota fiscal?",
+    "Nao consigo fazer login no app",
+    "Pix nao caiu na conta",
+    "Gostaria de saber o prazo de entrega",
+    "Estou esperando faz uma semana",
+    "Vc pode cancelar pra mim?",
+    # a bug report whose jargon is English keeps only these words to say it is Portuguese
+    "Deu erro 500 no endpoint de login depois do update",
+    "Depois da atualizacao ninguem consegue logar",
+    "Antes funcionava, agora deu pau",
+    "Estava tudo certo ate a migracao",
+    "Entao o sistema travou de novo",
+]:
+    check("latin_lang/pt-br " + text[:32], guess_latin_language(text), "pt")
+    check("route/pt-br " + text[:32], _r_lat.route(text).model, "multilingual")
+# each added word that is also an English token must not move English text
+for text in [
+    "Our Sao Paulo office still has not received the invoice",
+    "My VC asked for the cap table and the invoice",
+    "Nossa Cafe charged my card twice this month",
+    "The Boa Vista branch reported an outage this morning",
+    "The pra team will review the claim tomorrow",
+]:
+    check("route/pt-br control " + text[:32], _r_lat.route(text).model, "english")
 
 
 # --------------------------------------------------------------------- temperature clamp (#35)
@@ -290,6 +442,47 @@ rr.unload()
 check("lru/unload all", rr.loaded, [])
 
 
+# --------------------------------------------------------------------- default cap (#172)
+# #172 measured a workload that alternates languages at 20-23 s per request on CPU (reloading a
+# checkpoint every request) against 49-136 ms with both resident. Automatic routing only ever
+# chooses between `english` and `multilingual`, so the default holds both, and a deployment that
+# never alternates never builds the second.
+def counting_router(cap=None):
+    """Router whose loader records which checkpoints it had to build."""
+    rr = Router() if cap is None else Router(max_loaded=cap)
+    built = []
+
+    def load(name, _rr=rr, _built=built):
+        key = normalise_name(name)
+        if key in _rr._agents:
+            _rr._touch(key)
+            return _rr._agents[key]
+        _built.append(key)
+        _rr._agents[key] = _Stub(key)
+        _rr._order.append(key)
+        _rr._evict()
+        return _rr._agents[key]
+
+    rr.load = load
+    return rr, built
+
+
+check("lru/default is two", Router().max_loaded, 2)
+_en = {"body": "I was charged twice for invoice 4411, please refund."}
+_ml = {"body": "Der Kunde wurde zweimal belastet und moechte eine Rueckerstattung"}
+for cap, want_built in ((1, 20), (2, 2)):
+    cr, built = counting_router(cap)
+    for _ in range(10):                          # the reported alternating workload
+        cr.predict(_en, Q_GENERIC)
+        cr.predict(_ml, Q_GENERIC)
+    check("lru/alternating traffic, cap=%d builds" % cap, len(built), want_built)
+# and the default costs a single-language deployment nothing at all
+cr, built = counting_router()
+for _ in range(5):
+    cr.predict(_en, Q_GENERIC)
+check("lru/single-language traffic builds one checkpoint", built, ["english"])
+
+
 # --------------------------------------------------------------------- bundle vs standalone
 check("bundle/english is repo root", DEFAULT_MODELS["english"], (BUNDLE_REPO, None))
 check("bundle/multilingual subfolder", DEFAULT_MODELS["multilingual"], (BUNDLE_REPO, "multilingual"))
@@ -313,27 +506,62 @@ check("override/local path kept", r_local.route({"m": "मुझसे दो �
 
 
 # --------------------------------------------------------------------- preload
-rr = stubbed_router(1)
-rr.preload = lambda names=None, _r=rr: (
-    [_load_stub(_r, n) for n in (names or list(_r.models))],
-    _r)[1]
-# max_loaded must grow to fit what was preloaded, or the LRU evicts it immediately
-rp = stubbed_router(1)
-rp.max_loaded = max(rp.max_loaded, 3)
-for n in ("english", "multilingual", "typed-decisions"):
-    _load_stub(rp, n)
-check("preload/all three stay resident", sorted(rp.loaded),
-      ["english", "multilingual", "typed-decisions"])
-check("preload/max_loaded raised", rp.max_loaded >= 3, True)
+# Exercise the real preload/load/LRU paths; only checkpoint construction is stubbed.
+with patch("laya.agent.Agent", side_effect=lambda repo, **kw: _Stub(repo)) as build:
+    rp = Router(preload=True)
+    check("preload/all three stay resident", sorted(rp.loaded),
+          ["english", "multilingual", "typed-decisions"])
+    check("preload/max_loaded raised", rp.max_loaded, 3)
+    check("preload/builds each model once", build.call_count, 3)
+    check("preload/returns router", rp.preload() is rp, True)
+    check("preload/repeated call reuses models", build.call_count, 3)
 
-rp2 = stubbed_router(1)
-rp2.max_loaded = max(rp2.max_loaded, 2)
-for n in ("english", "multilingual"):
-    _load_stub(rp2, n)
-check("preload/subset stays resident", sorted(rp2.loaded), ["english", "multilingual"])
-# routing to an already-resident checkpoint must not evict anything
-_load_stub(rp2, "english")
-check("preload/touch does not evict", sorted(rp2.loaded), ["english", "multilingual"])
+    empty = Router()
+    empty.preload([])
+    check("preload/empty selection leaves models unloaded", empty.loaded, [])
+    check("preload/empty selection builds nothing", build.call_count, 3)
+
+    rp2 = Router()
+    rp2.preload(["english", "multilingual"])
+    check("preload/subset stays resident", sorted(rp2.loaded), ["english", "multilingual"])
+    check("preload/subset capacity", rp2.max_loaded, 2)
+    rp2.load("english")
+    check("preload/touch does not evict", sorted(rp2.loaded), ["english", "multilingual"])
+    check("preload/touch does not rebuild", build.call_count, 5)
+
+    incremental = Router()
+    incremental.preload(["english"])
+    english = incremental.load("english")
+    incremental.preload(["multilingual"])
+    check("preload/incremental keeps both models", incremental.loaded, ["english", "multilingual"])
+    check("preload/incremental capacity", incremental.max_loaded, 2)
+    check("preload/incremental reuses original", incremental.load("english") is english, True)
+    check("preload/incremental avoids rebuilds", build.call_count, 7)
+
+    incremental.preload(["en", "english", "multi", "ml"])
+    check("preload/aliases do not inflate capacity", incremental.max_loaded, 2)
+    check("preload/aliases reuse models", build.call_count, 7)
+    incremental.preload(["english", "typed-decisions"])
+    check("preload/overlap preserves unrequested models", sorted(incremental.loaded),
+          ["english", "multilingual", "typed-decisions"])
+    check("preload/overlap capacity", incremental.max_loaded, 3)
+    for name in DEFAULT_MODELS:
+        incremental.predict("hello", Q_GENERIC, model=name)
+    check("preload/predictions never rebuild", build.call_count, 8)
+
+    attached = Router()
+    original = _Stub("already-built")
+    attached.attach("english", original)
+    attached.preload(["multilingual"])
+    check("preload/keeps attached model", attached.load("english") is original, True)
+    check("preload/attached and new stay resident", sorted(attached.loaded), ["english", "multilingual"])
+    check("preload/attached capacity", attached.max_loaded, 2)
+    check("preload/attached model not rebuilt", build.call_count, 9)
+
+    roomy = Router(max_loaded=5)
+    roomy.preload(["en", "english", "multi"])
+    check("preload/larger capacity is preserved", roomy.max_loaded, 5)
+    check("preload/duplicates build once", build.call_count, 11)
 
 
 # --------------------------------------------------------------------- attach
@@ -425,6 +653,61 @@ order_len, agents_len, order = _concurrent_hotpath()
 check("threads/hot-path loads keep one entry", order_len, 1)
 check("threads/hot-path loads keep agents consistent", agents_len, 1)
 check("threads/hot-path order intact", order, ["english"])
+
+
+
+# --------------------------------------------------------------------- unlisted scripts
+# `detect_script` counts an alphabetic character only when one of `_SCRIPT_RANGES` claims
+# it. Those ranges cover the scripts the checkpoints were measured on, and most of Unicode
+# is outside them -- 68% of alphabetic codepoints, including the CJK extensions, the kana
+# supplements, bopomofo, halfwidth katakana and dozens of smaller scripts. An unclaimed
+# character used to be counted nowhere, so text written only in such a script produced a
+# total of 0, was reported as "unknown", and `analyse` treats "unknown" as English. It was
+# therefore routed to the English checkpoint, which has no tokens for it at all, with the
+# reason "no letters detected in state" -- for text that plainly has letters.
+#
+# Every case below reported unknown / is_english=True / model "english" before this change.
+for label, text in (
+    ("halfwidth katakana", "ｱﾘｶﾞﾄｳ"),
+    ("bopomofo", "ㄆㄇㄈㄉ"),
+    ("kana supplement", "\U0001B000\U0001B001"),
+    ("CJK Ext-B", "\U00020000\U00020001"),
+    ("hangul jamo ext-A", "\ua960\ua961"),
+    ("Cherokee", "ᏣᎳᎩ"),
+    ("Mongolian", "ᠮᠣᠩᠭᠣᠯ"),
+    ("Syriac", "ܫܠܡܐ"),
+    ("Thaana", "ދިވެހި"),
+    ("Tifinagh", "ⵜⴰⵎⴰⵣⵉⵖⵜ"),
+    ("Yi", "ꆈꌠ"),
+):
+    check("unlisted/" + label + " is not called English", analyse(text)["is_english"], False)
+    check("unlisted/" + label + " routes to multilingual",
+          Router().route(text)["model"], "multilingual")
+
+# Fullwidth Latin is Latin, not an unlisted script.
+check("unlisted/fullwidth latin is latin", detect_script("ＨＥＬＬＯ"), "latin")
+
+# A state with no letters at all must keep behaving exactly as before.
+for label, text in (("empty", ""), ("digits only", "12345 67890"), ("emoji only", "😀😀😀")):
+    check("unlisted/letterless " + label + " is still unknown",
+          analyse(text)["script"], "unknown")
+    check("unlisted/letterless " + label + " keeps the default",
+          Router().route(text)["model"], "english")
+
+# The scripts the table does name must be untouched.
+for label, text, script in (
+    ("english", "please cancel my subscription", "latin"),
+    ("german", "Mein Konto wurde zweimal belastet, bitte erstatten Sie den Betrag", "latin"),
+    ("hindi", "यह एक हिंदी वाक्य है", "devanagari"),
+    ("chinese", "请取消我的订阅", "han"),
+    ("japanese", "ありがとう", "kana"),
+    ("korean", "감사합니다", "hangul"),
+    ("russian", "Мой аккаунт был списан дважды", "cyrillic"),
+    ("arabic", "تم خصم حسابي مرتين", "arabic"),
+    ("greek", "Η χρέωση έγινε δύο φορές", "greek"),
+    ("armenian", "Իմ հաշիվը գանձվել է երկու անգամ", "armenian"),
+):
+    check("unlisted/regression " + label + " script", detect_script(text), script)
 
 # --------------------------------------------------------------------- report
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))

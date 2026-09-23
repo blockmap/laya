@@ -115,6 +115,10 @@ class Agent:
         """
         from safetensors.torch import load_file
         from transformers import AutoTokenizer
+        try:
+            from transformers.initialization import no_init_weights
+        except ImportError:  # Transformers 4.x
+            from transformers.modeling_utils import no_init_weights
 
         model_dir = model_id_or_path
         if not os.path.exists(model_dir):
@@ -185,7 +189,10 @@ class Agent:
         self.tok = AutoTokenizer.from_pretrained(tok_dir if os.path.exists(tok_dir) else self.cfg.get("encoder"))
 
         enc_dir = os.path.join(model_dir, "encoder")
-        self.model = build_model(self.cfg, encoder_dir=enc_dir if os.path.exists(enc_dir) else None)
+        # The checkpoint supplies every parameter; skip random/base-model weights.
+        with no_init_weights():
+            self.model = build_model(self.cfg, encoder_dir=enc_dir if os.path.exists(enc_dir) else None,
+                                     pretrained=False)
 
         # Load weights and verify architectural compatibility
         weights = load_file(weights_path)
@@ -208,14 +215,22 @@ class Agent:
         self.temperature = [clamp_temperature(t) for t in self.temperature_raw]
         self.temperature_by_options = {k: clamp_temperature(v)
                                        for k, v in self.temperature_by_options_raw.items()}
-        rejected = ["%s=%.4g" % (k, float(v)) for k, v in self.temperature_by_options_raw.items()
-                    if clamp_temperature(v) != float(v)]
-        rejected += ["temperature[%d]=%.4g" % (i, float(t)) for i, t in enumerate(self.temperature_raw)
-                     if clamp_temperature(t) != float(t)]
+        entries = [(k, v, self.temperature_by_options[k]) for k, v in self.temperature_by_options_raw.items()]
+        entries += [("temperature[%d]" % i, t, self.temperature[i]) for i, t in enumerate(self.temperature_raw)]
+        rejected = []
+        for name, raw, applied in entries:
+            try:
+                if float(raw) == applied:
+                    continue
+            except (TypeError, ValueError):
+                # Invalid entries already have a neutral fallback; diagnostics must not
+                # repeat the failed conversion or prevent the checkpoint from loading.
+                pass
+            rejected.append("%s=%r -> %g" % (name, raw, applied))
         if rejected:
             warnings.warn(
-                "laya: this checkpoint ships temperatures outside [%g, %g] which would distort "
-                "confidence; clamping %s. Treat confidence from the affected buckets as uncalibrated."
+                "laya: this checkpoint ships invalid temperatures or values outside [%g, %g]; "
+                "using %s. Treat confidence from the affected entries as uncalibrated."
                 % (TEMP_MIN, TEMP_MAX, ", ".join(rejected)),
                 RuntimeWarning, stacklevel=2)
         self.dtype = amp_dtype(self.cfg.get("amp_dtype", "fp16"))
@@ -252,11 +267,49 @@ class Agent:
                 % (fell_back_from, fell_back_why), flush=True)
 
     @staticmethod
+    def _check_question(qid: str, qdef: Any) -> None:
+        """Reject a question that cannot be answered, naming it and what to fix.
+
+        `render_options` reads `criteria` in the shape the question's type expects and the decision
+        head needs at least one option, so a malformed definition used to surface from three frames
+        down as something that names neither the question nor the problem: `AttributeError:
+        'NoneType' object has no attribute 'items'`, `KeyError: 'bool'`, or a `selected index k out
+        of range` raised inside the model for a question that ended up with no options at all.
+        """
+        if not isinstance(qdef, dict):
+            raise ValueError("question %r: definition must be a dict, got %s"
+                             % (qid, type(qdef).__name__))
+        t = qdef.get("type")
+        if t not in QTYPES:
+            raise ValueError("question %r: unknown type %r; use one of %s" % (qid, t, sorted(QTYPES)))
+        if "instructions" not in qdef:
+            raise ValueError("question %r: no 'instructions'; add the text the model should answer" % (qid,))
+        crit = qdef.get("criteria")
+        if t == "choice":
+            if not isinstance(crit, (dict, list)):
+                raise ValueError("question %r: a choice question takes 'criteria' as a dict of "
+                                 "label -> description, or a list of labels" % (qid,))
+            if not crit:
+                raise ValueError("question %r: a choice question needs at least one criterion" % (qid,))
+        elif t == "score":
+            if not isinstance(crit, list):
+                raise ValueError("question %r: a score question takes 'criteria' as a list of level "
+                                 "descriptions, index 0 first" % (qid,))
+            if not crit:
+                raise ValueError("question %r: a score question needs at least one level" % (qid,))
+        elif crit is not None and not isinstance(crit, dict):
+            raise ValueError("question %r: a noul question takes 'criteria' as a dict with optional "
+                             "'true'/'false' descriptions, or omits it" % (qid,))
+
+    @staticmethod
     def _to_internal(qdef: Dict) -> Dict:
         t = qdef["type"]
         crit = qdef.get("criteria")
         if t == "choice" and isinstance(crit, list):
             crit = {c: None for c in crit}
+        elif t == "noul" and isinstance(crit, dict):
+            # Normalize boolean literal keys to string keys ("true"/"false")
+            crit = {str(k).lower(): v for k, v in crit.items()}
         ins = qdef["instructions"]
         if not isinstance(ins, str):
             ins = json.dumps(ins)
@@ -271,17 +324,26 @@ class Agent:
             questions: Dictionary mapping question_id -> question definition.
                 - choice: {"type": "choice", "instructions": "...", "criteria": {"optA": "...", ...}}
                 - score:  {"type": "score",  "instructions": "...", "criteria": ["lvl0", "lvl1", ...]}
-                - noul:   {"type": "noul",   "instructions": "..."}
+                - noul:   {"type": "noul",   "instructions": "...", "criteria": {"true": "...", "false": "..."}}
 
         Returns:
             Dictionary with answers, probabilities, calibrated confidence, and token usage.
+            Empty questions return empty answers and zero token usage without tokenization
+            or a model forward pass.
         """
         ids = list(questions.keys())
+        if not ids:
+            return {
+                "model": "laya-rl-agent",
+                "answers": {},
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
         items = []
         max_len = self.cfg.get("max_len", 512)
         head_max_len = self.cfg.get("head_max_len", 192)
 
         for qid in ids:
+            self._check_question(qid, questions[qid])
             q = self._to_internal(questions[qid])
             seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len)
             if len(markers) != len(render_options(q)):
@@ -366,6 +428,23 @@ class Agent:
             "answers": answers,
             "usage": {"input_tokens": n_tokens, "output_tokens": 0},
         }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self, "model") and self.model is not None:
+            del self.model
+            self.model = None
+        try:
+            import gc
+            gc.collect()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return False
 
     predict = system_one
 

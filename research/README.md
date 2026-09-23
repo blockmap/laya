@@ -3,6 +3,10 @@
 Benchmark harnesses and raw results for the Laya checkpoints. This branch is the evidence behind
 the numbers quoted in the main README — nothing here is imported by the `laya` package.
 
+## Community diagnostics
+
+- [Chinese workplace decisions (Feishu-style)](benchmarks/feishu_zh/README.md) — 64 synthetic scenarios, paired recorded Laya/Jev responses, English/Chinese cards, and a model-free audit. [中文入口](benchmarks/feishu_zh/README.zh-CN.md). Start with `python research/benchmarks/feishu_zh/audit.py`; no downloads or API keys required. This is a contributed historical snapshot, separate from the upstream sweeps below.
+
 ## Scripts
 
 | file | what it does |
@@ -48,8 +52,9 @@ batched.
 
 ## On comparisons with Jev
 
-There is no TypeSafe API credential in this project, so **Jev was never run here**. Every Jev
-figure quoted is third-party published, with different sample sizes and prompts:
+For the original upstream suites listed above, **Jev was not run directly**. Their Jev
+figures are third-party published, with different sample sizes and prompts. The separate
+community diagnostic linked above includes paired API responses and documents its own limitations:
 
 - [AbdelStark/jev-benchmarks](https://github.com/AbdelStark/jev-benchmarks) — AG News 0.910,
   Banking77 0.870, DAIR Emotion 0.480 (Brier 0.846, NLL 5.588, zero probability on the true label

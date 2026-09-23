@@ -136,11 +136,11 @@ class DecisionModel(nn.Module):
         return logits, act_logits
 
 
-def build_model(cfg: Dict, encoder_dir: Optional[str] = None) -> DecisionModel:
+def build_model(cfg: Dict, encoder_dir: Optional[str] = None, pretrained: bool = True) -> DecisionModel:
     from transformers import AutoConfig, AutoModel
 
-    if encoder_dir and os.path.exists(encoder_dir):
-        ecfg = AutoConfig.from_pretrained(encoder_dir)
+    if not pretrained or (encoder_dir and os.path.exists(encoder_dir)):
+        ecfg = AutoConfig.from_pretrained(encoder_dir or cfg["encoder"])
         enc = AutoModel.from_config(ecfg, attn_implementation="sdpa")
     else:
         enc = AutoModel.from_pretrained(cfg["encoder"], attn_implementation="sdpa")
@@ -200,8 +200,8 @@ def ece_score(conf: np.ndarray, correct: np.ndarray, bins: int = 15) -> float:
         return float("nan")
     edges = np.linspace(0, 1, bins + 1)
     e = 0.0
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        sel = (conf > lo) & (conf <= hi)
+    for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+        sel = (conf >= lo if i == 0 else conf > lo) & (conf <= hi)
         if sel.any():
             e += sel.mean() * abs(conf[sel].mean() - correct[sel].mean())
     return float(e)
