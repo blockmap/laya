@@ -7,4 +7,4 @@ sentencepiece==0.1.99
 pydantic-settings==2.1.0
 accelerate==0.27.2
 huggingface-hub==0.26.2
-hf_transfer==1.0.3
+hf_transfer==0.1.9
