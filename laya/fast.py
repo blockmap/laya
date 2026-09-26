@@ -1,14 +1,23 @@
-"""GPU fast path for laya: TileLang fused kernels + bf16 resident weights + CUDA graphs.
+"""GPU fast path for laya: TileLang fused kernels + 16-bit resident weights + CUDA graphs.
 
     agent = laya.load("convaiinnovations/laya", fast=True)      # or agent.accelerate()
 
 Requires CUDA and `pip install laya[fast]` (tilelang).  Falls back to the stock forward otherwise.
 """
 import sys
+import threading
 import torch
 from . import tl_kernels as K
 
-BF = torch.bfloat16
+_KERNEL_DTYPES = {torch.bfloat16: "bfloat16", torch.float16: "float16"}
+
+
+def _top_two(probs):
+    """Return two columns for confidence features, including k == 1."""
+    if probs.shape[-1] == 1:
+        top1 = probs[:, 0]
+        return torch.stack([top1, torch.zeros_like(top1)], dim=-1)
+    return probs.topk(2, -1).values
 
 
 def _bucket_n(n):
@@ -16,20 +25,31 @@ def _bucket_n(n):
 
 
 class FastLaya:
-    def __init__(self, model, max_len=1024, use_graphs=True, verbose=False):
+    def __init__(self, model, max_len=1024, use_graphs=True, verbose=False, dtype=torch.bfloat16):
+        """`dtype` is the 16-bit type of the weights and the activations between kernels (the residual stream
+        and every accumulation stay fp32).  Pass the agent's autocast dtype so the fast path runs in the same
+        precision as the stock forward it replaces: bf16 (the shipped checkpoints' default) or fp16."""
+        if dtype not in _KERNEL_DTYPES:
+            raise ValueError("laya fast path supports torch.bfloat16 and torch.float16, got %s" % (dtype,))
+        self.dtype = dt = dtype
+        kd = _KERNEL_DTYPES[dtype]
         self.m = model
         enc = model.encoder
         cfg = enc.config
         dev = next(model.parameters()).device
         self.dev = dev
         self.use_graphs = use_graphs
+        # CUDA graphs reuse static input/output buffers.  Keep the complete
+        # forward under one lock so concurrent callers cannot overwrite those
+        # buffers between replay and head decoding.
+        self._forward_lock = threading.RLock()
         self.verbose = verbose
         self.H, self.Dh, self.D = cfg.num_attention_heads, cfg.hidden_size // cfg.num_attention_heads, cfg.hidden_size
         self.F = cfg.intermediate_size
         self.eps = cfg.norm_eps
         self.max_len = max_len
         f32 = lambda t: t.detach().float().contiguous()
-        b16 = lambda t: t.detach().to(BF).contiguous()
+        b16 = lambda t: t.detach().to(dt).contiguous()
         zeros = torch.zeros(self.D, device=dev)
         self.zeros = {self.D: zeros, 3 * self.D: torch.zeros(3 * self.D, device=dev), 4 * self.D: torch.zeros(4 * self.D, device=dev),
                       2 * self.F: torch.zeros(2 * self.F, device=dev)}
@@ -48,7 +68,7 @@ class FastLaya:
                 mlp_ln=f32(lyr.mlp_norm.weight), wi=b16(lyr.mlp.Wi.weight), wo2=b16(lyr.mlp.Wo.weight),
                 window=(win if lyr.attention_type == "sliding_attention" else 0), ltype=lyr.attention_type))
         self.final_ln = f32(enc.final_norm.weight)
-        # --- rotary tables (rounded through bf16 exactly like HF does before applying)
+        # --- rotary tables (rounded through the 16-bit dtype exactly like HF does before applying)
         rot = enc.rotary_emb
         pos = torch.arange(max_len, device=dev).float()
         self.rope = {}
@@ -56,7 +76,7 @@ class FastLaya:
             inv = getattr(rot, f"{lt}_inv_freq").float()
             scl = getattr(rot, f"{lt}_attention_scaling")
             fr = torch.outer(pos, inv)
-            self.rope[lt] = ((fr.cos() * scl).to(BF).float().contiguous(), (fr.sin() * scl).to(BF).float().contiguous())
+            self.rope[lt] = ((fr.cos() * scl).to(dt).float().contiguous(), (fr.sin() * scl).to(dt).float().contiguous())
         # --- decision head (nn.TransformerEncoderLayer, norm_first, relu)
         self.type_emb = b16(model.type_emb.weight)
         self.head = []
@@ -68,17 +88,18 @@ class FastLaya:
                 l1w=b16(lyr.linear1.weight), l1b=f32(lyr.linear1.bias), l2w=b16(lyr.linear2.weight), l2b=f32(lyr.linear2.bias)))
         # --- kernels (M is dynamic, so these compile once)
         D, F = self.D, self.F
-        self.k_qkv = K.gemm_kernel(3 * D, D)
-        self.k_o = K.gemm_kernel(D, D)
-        self.k_geglu = K.gemm_geglu_kernel(F, D)
-        self.k_o2 = K.gemm_kernel(D, F)
-        self.k_addln = K.add_ln_kernel(D, residual=True, bias=False, eps=self.eps)
-        self.k_addln_b = K.add_ln_kernel(D, residual=True, bias=True, eps=1e-5)
-        self.k_ln_b = K.add_ln_kernel(D, residual=False, bias=True, eps=1e-5)
-        self.k_in = K.gemm_kernel(3 * D, D, bias=True)
-        self.k_out = K.gemm_kernel(D, D, bias=True)
-        self.k_ffn1 = K.gemm_kernel(4 * D, D, bias=True, act="relu")
-        self.k_ffn2 = K.gemm_kernel(D, 4 * D, bias=True)
+        self.kdtype = kd
+        self.k_qkv = K.gemm_kernel(3 * D, D, dtype=kd)
+        self.k_o = K.gemm_kernel(D, D, dtype=kd)
+        self.k_geglu = K.gemm_geglu_kernel(F, D, dtype=kd)
+        self.k_o2 = K.gemm_kernel(D, F, dtype=kd)
+        self.k_addln = K.add_ln_kernel(D, residual=True, bias=False, eps=self.eps, dtype=kd)
+        self.k_addln_b = K.add_ln_kernel(D, residual=True, bias=True, eps=1e-5, dtype=kd)
+        self.k_ln_b = K.add_ln_kernel(D, residual=False, bias=True, eps=1e-5, dtype=kd)
+        self.k_in = K.gemm_kernel(3 * D, D, bias=True, dtype=kd)
+        self.k_out = K.gemm_kernel(D, D, bias=True, dtype=kd)
+        self.k_ffn1 = K.gemm_kernel(4 * D, D, bias=True, act="relu", dtype=kd)
+        self.k_ffn2 = K.gemm_kernel(D, 4 * D, bias=True, dtype=kd)
         self._rope_k, self._rope_tab, self._attn_k = None, {}, {}
         self.graphs = {}
 
@@ -88,7 +109,7 @@ class FastLaya:
 
     def rope_k(self):
         if self._rope_k is None:
-            self._rope_k = K.rope_kernel(self.H, self.Dh)
+            self._rope_k = K.rope_kernel(self.H, self.Dh, dtype=self.kdtype)
         return self._rope_k
 
     def rope_tab(self, ltype, L):
@@ -101,22 +122,22 @@ class FastLaya:
     def attn_k(self, B, L, window):
         key = (None, None, window) if L <= self.DYNAMIC_MAX_L else (B, L, window)
         if key not in self._attn_k:
-            self._attn_k[key] = K.attn_kernel(key[0], key[1], self.H, self.Dh, window=window)
+            self._attn_k[key] = K.attn_kernel(key[0], key[1], self.H, self.Dh, window=window, dtype=self.kdtype)
         return self._attn_k[key]
 
     # ------------------------------------------------------------------ encoder + head on padded [B, L]
     def _encode(self, ids, lens, qtype):
-        """ids [B,L] long (padded), lens [B] int32, qtype [B] long -> hidden [B, L, D] bf16"""
+        """ids [B,L] long (padded), lens [B] int32, qtype [B] long -> hidden [B, L, D] fp32"""
         B, L = ids.shape
         M, D = B * L, self.D
         dev = self.dev
         emb = torch.nn.functional.embedding(ids, self.emb_w).view(M, D).float()
         # residual stream = embeddings.norm(emb), kept in fp32 exactly like the stock autocast path
         X = torch.nn.functional.layer_norm(emb, (D,), self.emb_ln, None, self.eps)
-        Y = X.to(BF)                                                            # layer 0 attends to it directly (attn_norm = Identity)
-        qkv = torch.empty(M, 3 * D, device=dev, dtype=BF)
-        O = torch.empty(M, D, device=dev, dtype=BF)
-        G = torch.empty(M, self.F, device=dev, dtype=BF)
+        Y = X.to(self.dtype)                                                            # layer 0 attends to it directly (attn_norm = Identity)
+        qkv = torch.empty(M, 3 * D, device=dev, dtype=self.dtype)
+        O = torch.empty(M, D, device=dev, dtype=self.dtype)
+        G = torch.empty(M, self.F, device=dev, dtype=self.dtype)
         z = self.zeros
         nl = len(self.layers)
         for i, ly in enumerate(self.layers):
@@ -132,7 +153,7 @@ class FastLaya:
             self.k_addln(X, Y, nxt, z[D], Y)                                    # X += Y ; Y = next norm(X)
         # decision head: h = final_norm(x) + type_emb ; 2 x pre-norm transformer layers (relu ffn)
         X = (Y.view(B, L, D).float() + self.type_emb[qtype].float()[:, None, :]).view(M, D).contiguous()   # fp32 stream for the head
-        F1 = torch.empty(M, 4 * D, device=dev, dtype=BF)
+        F1 = torch.empty(M, 4 * D, device=dev, dtype=self.dtype)
         for j, h in enumerate(self.head):
             self.k_ln_b(X, Y, h["n1w"], h["n1b"], Y)
             self.k_in(Y, h["in_w"], h["in_b"], qkv)
@@ -169,6 +190,11 @@ class FastLaya:
     # ------------------------------------------------------------------ DecisionModel.forward replacement
     @torch.no_grad()
     def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder=False):
+        with self._forward_lock:
+            return self._forward_unlocked(input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder)
+
+    @torch.no_grad()
+    def _forward_unlocked(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder=False):
         m = self.m
         N, L0 = input_ids.shape
         g = 16 if L0 <= self.DYNAMIC_MAX_L else self.LONG_BUCKET
@@ -190,7 +216,10 @@ class FastLaya:
         p = torch.softmax(logits, -1)
         k = marker_mask.sum(-1).clamp(min=2).float()
         ent = -(p * torch.log(p.clamp_min(1e-9))).sum(-1) / torch.log(k)
-        top2 = p.topk(2, -1).values
+        # Choice questions are allowed to contain one criterion.  The stock
+        # DecisionModel handles that case, but topk(2) raises when the marker
+        # dimension has width one.
+        top2 = _top_two(p)
         feats = torch.stack([top2[:, 0], top2[:, 0] - top2[:, 1], ent, k / 255.0], -1)
         pooled = h[:, 0].float()
         act_logits = m.act_head(torch.cat([pooled, feats], -1))

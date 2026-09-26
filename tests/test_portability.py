@@ -100,29 +100,35 @@ def _autocast_that_rejects_non_cuda(entered):
     return fake
 
 
+# A disabled context must never enter torch.autocast: on a torch build with no MPS autocast
+# backend, entering it raises. The gate (Agent._amp_enabled_for) decides `enabled`.
 for name in ("cpu", "mps", "xpu"):
     entered = []
     with mock.patch.object(_agent.torch, "autocast", _autocast_that_rejects_non_cuda(entered)):
         try:
-            ctx = _agent._amp_context(SimpleNamespace(type=name), torch.float32)
+            ctx = _agent._amp_context(SimpleNamespace(type=name), torch.float32, False)
             with ctx:
                 pass
-            check_true("amp/%s never enters autocast" % name, entered == [], "entered %s" % entered)
+            check_true("amp/%s never enters autocast when disabled" % name, entered == [],
+                       "entered %s" % entered)
         except RuntimeError as e:
             FAIL.append("amp/%s raised %s" % (name, e))
+
+check_true("amp/disabled is a no-op",
+           isinstance(_agent._amp_context(SimpleNamespace(type="mps"), torch.float16, False), nullcontext))
 
 # CUDA still gets mixed precision, with the dtype the model was configured for
 entered = []
 with mock.patch.object(_agent.torch, "autocast", _autocast_that_rejects_non_cuda(entered)):
-    with _agent._amp_context(SimpleNamespace(type="cuda"), torch.float16):
+    with _agent._amp_context(SimpleNamespace(type="cuda"), torch.float16, True):
         pass
 check("amp/cuda uses autocast", entered, ["cuda"])
 
 # the old unconditional call is what broke MPS -- make sure it cannot come back
 import inspect  # noqa: E402
 
-_src = inspect.getsource(_agent.Agent._forward)
-check_true("amp/forward pass goes through _amp_context", "with _amp_context(self.device, self.dtype):" in _src)
+_src = inspect.getsource(_agent.Agent._infer)
+check_true("amp/infer goes through _amp_context", "with _amp_context(self.device, self.dtype, enabled)" in _src)
 check_true("amp/no unconditional autocast in the forward pass",
            "torch.autocast(device_type=self.device.type" not in _src)
 
@@ -135,8 +141,11 @@ class _FakeTok:
     cls_token_id, sep_token_id, mask_token_id, pad_token_id = 1, 2, 3, 0
     mask_token = "[M]"
 
-    def __call__(self, text, add_special_tokens=False):
-        return {"input_ids": [10 + (ord(c) % 40) for c in text]}
+    def __call__(self, text, add_special_tokens=False, truncation=False, max_length=None):
+        ids = [10 + (ord(c) % 40) for c in text]
+        if truncation and max_length:
+            ids = ids[:max_length]
+        return {"input_ids": ids}
 
 
 class _FailsOnce(torch.nn.Module):
@@ -154,6 +163,17 @@ class _FailsOnce(torch.nn.Module):
         logits = torch.zeros((input_ids.shape[0], marker_mask.shape[1]))
         logits[:, 0] = 1.0
         return logits, torch.tensor([[1.0, 0.0]])
+
+
+class _RestoreFails(_FailsOnce):
+    """OOMs once like _FailsOnce, but also refuses to move back to the accelerator afterwards,
+    so `_restore_runtime`'s `model.to(device)` fails and the agent must stay on CPU."""
+    def to(self, *args, **kwargs):
+        target = args[0] if args else kwargs.get("device")
+        dt = getattr(target, "type", None) or (target if isinstance(target, str) else None)
+        if dt == "mps":
+            raise RuntimeError("CUDA out of memory: model no longer fits after the retry")
+        return super().to(*args, **kwargs)
 
 
 def _bare_agent(model):
@@ -191,8 +211,13 @@ with mock.patch.object(torch.Tensor, "to", _to_that_ignores_mps):
         result = agent.predict({"body": "some state"}, QUESTIONS)
         check("fallback/answers after a memory failure", result["answers"]["q"]["choice"], "a")
         check("fallback/forward pass retried once", agent.model.calls, 2)
-        check("fallback/device is cpu now", agent.device.type, "cpu")
-        check("fallback/dtype downgraded to fp32", agent.dtype, torch.float32)
+        # the demotion is scoped to the failed request (#344): one oversized call must not
+        # leave every later call on a ~10-15x slower CPU path for the life of the process
+        check("fallback/device restored after the retry", agent.device.type, "mps")
+        check("fallback/a later request is answered without a new demotion",
+              agent.predict({"body": "another state"}, QUESTIONS)["answers"]["q"]["choice"], "a")
+        check("fallback/later request needs no extra forward", agent.model.calls, 3)
+        check("fallback/device still the original after a later call", agent.device.type, "mps")
     except Exception as e:  # noqa: BLE001
         FAIL.append("fallback/memory failure was not survived: %s: %s" % (type(e).__name__, e))
 
@@ -206,6 +231,31 @@ with mock.patch.object(torch.Tensor, "to", _to_that_ignores_mps):
         PASS.append("fallback/non-memory error propagates")
     except Exception as e:  # noqa: BLE001
         FAIL.append("fallback/non-memory error raised %s instead of RuntimeError" % type(e).__name__)
+
+    # a RuntimeError that merely mentions cuda is not an OOM (#344): it used to demote the
+    # agent to CPU permanently and return silently-CPU results
+    agent = _bare_agent(_FailsOnce("CUDA error: device-side assert triggered"))
+    try:
+        agent.predict({"body": "some state"}, QUESTIONS)
+        FAIL.append("fallback/cuda-worded non-memory error propagates (nothing raised)")
+    except RuntimeError:
+        PASS.append("fallback/cuda-worded non-memory error propagates")
+    except Exception as e:  # noqa: BLE001
+        FAIL.append("fallback/cuda-worded non-memory error raised %s instead of RuntimeError"
+                    % type(e).__name__)
+
+    # restore fails: the model no longer fits the accelerator after the CPU retry, so it stays
+    # demoted rather than crashing a request that already succeeded
+    agent = _bare_agent(_RestoreFails("CUDA out of memory. Tried to allocate 2.00 GiB"))
+    try:
+        result = agent.predict({"body": "some state"}, QUESTIONS)
+        check("fallback/restore-failure still answers the request", result["answers"]["q"]["choice"], "a")
+        check("fallback/restore-failure stays on cpu", agent.device.type, "cpu")
+        check("fallback/restore-failure: later call runs on cpu without crashing",
+              agent.predict({"body": "another state"}, QUESTIONS)["answers"]["q"]["choice"], "a")
+        check("fallback/restore-failure: no extra forward beyond retry + later call", agent.model.calls, 3)
+    except Exception as e:  # noqa: BLE001
+        FAIL.append("fallback/restore-failure not survived: %s: %s" % (type(e).__name__, e))
 
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))

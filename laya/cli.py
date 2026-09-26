@@ -4,10 +4,12 @@
     laya "Refactor this service" --predict              # full answers, loads the checkpoint
     laya                                                # interactive mode
     laya "Mein Konto wurde zweimal belastet" --lang de  # explicit language
+    laya "My payment failed twice" --preset triage      # a ready-made question preset
 
 Routing (the default) never downloads a checkpoint, so it works offline and
 returns in milliseconds. --predict loads the routed checkpoint on first use,
-which needs network access to the Hugging Face hub.
+which needs network access to the Hugging Face hub. --preset answers one of the
+ready-made question presets from laya.presets and implies --predict.
 """
 
 import argparse
@@ -15,6 +17,26 @@ import json
 import sys
 
 import laya
+
+# Ready-made question presets a prediction can run instead of router_questions().
+PRESETS = {
+    "email": laya.email_questions,
+    "guard": laya.guard_questions,
+    "moderation": laya.moderation_questions,
+    "router": laya.router_questions,
+    "triage": laya.triage_questions,
+}
+
+# The state field each preset's instructions name, so the CLI puts the text where that question
+# set reads it. `router` is also the default for `--predict`, which answers
+# `laya.router_questions()`. Kept beside PRESETS so a new preset and its key arrive together.
+PRESET_STATE_KEYS = {
+    "email": "body",
+    "guard": "prompt",
+    "moderation": "post",
+    "router": "request",
+    "triage": "message",
+}
 
 
 def build_parser():
@@ -29,6 +51,9 @@ def build_parser():
                         help="force a checkpoint instead of auto-routing")
     parser.add_argument("--lang", help="force a language, e.g. en or de, instead of detecting it")
     parser.add_argument("--task", help="force a typed-decisions workflow instead of detecting it")
+    parser.add_argument("--preset", choices=sorted(PRESETS), metavar="NAME",
+                        help="answer a ready-made question preset (%s) instead of the router questions; implies --predict"
+                        % ", ".join(sorted(PRESETS)))
     parser.add_argument("--device", help="torch device, e.g. cpu or cuda")
     parser.add_argument("--json", action="store_true", help="print the raw result as JSON")
     return parser
@@ -53,7 +78,9 @@ def show_answers(result):
         print()
     for qid, answer in result.get("answers", {}).items():
         if "choice" in answer:
-            detail = "%s (p=%.3f)" % (answer["choice"], answer.get("probability", 0.0))
+            choice = answer["choice"]
+            probability = answer.get("probabilities", {}).get(choice, 0.0)
+            detail = "%s (p=%.3f)" % (choice, probability)
         elif "score" in answer:
             detail = "%.2f" % answer["score"]
         elif "noul" in answer:
@@ -66,16 +93,25 @@ def show_answers(result):
 def run(text, args, router=None):
     """Route or predict one request; returns 0 on success, 2 on a handled error."""
     router = router or make_router(args)
-    state = {"text": text}
     try:
-        if args.predict:
-            result = router.predict(state, laya.router_questions(),
+        if args.predict or args.preset:
+            questions = PRESETS[args.preset]() if args.preset else laya.router_questions()
+            # Each preset's instructions name the field they read -- `` `message` ``,
+            # `` `body` ``, `` `prompt` ``, `` `post` ``, `` `request` `` -- and the CLI used to
+            # send every request as `{"text": ...}`, a key none of them names, so the model was
+            # asked about a field that was not there. The state key therefore follows the
+            # question set being answered. Routing is not affected either way: `route` reads the
+            # state only for language detection, which is key-invariant, so the default path
+            # keeps `{"text": ...}`.
+            state = {PRESET_STATE_KEYS.get(args.preset, "request"): text}
+            result = router.predict(state, questions,
                                     model=args.model, task=args.task, lang=args.lang)
             if args.json:
                 print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
             else:
                 show_answers(result)
         else:
+            state = {"text": text}
             decision = router.route(state, model=args.model, task=args.task, lang=args.lang)
             if args.json:
                 print(json.dumps(dict(decision), ensure_ascii=False, indent=2, default=str))
@@ -109,6 +145,10 @@ def interactive(args):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "eval":       # `laya eval ...` mirrors the `laya-evals` script
+        from .evals_cli import main as eval_main
+        return eval_main(argv[1:])
     args = build_parser().parse_args(argv)
     text = " ".join(args.text).strip()
     if not text:

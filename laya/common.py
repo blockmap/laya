@@ -2,6 +2,8 @@
 import json
 import math
 import os
+import threading
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -12,6 +14,20 @@ from torch.utils.checkpoint import checkpoint
 QTYPES = {"choice": 0, "score": 1, "noul": 2}
 QTYPE_NAMES = {v: k for k, v in QTYPES.items()}
 _DEFAULT_NOUL_LABELS = {"false": "false", "true": "true"}
+
+# A fast tokenizer is not read-only: `truncation=True` / `padding=True` make it call
+# `enable_truncation` / `enable_padding`, which mutates the shared Rust object. One tokenizer is
+# parsed per checkpoint directory and shared by every Agent that wants it, so concurrent
+# `predict()` calls -- on one Agent or on two sharing the cache -- raced and raised
+# `RuntimeError: Already borrowed`. Serialise encoding instead: it is a small fraction of a call
+# next to the forward pass, and this keeps the cache's single parse.
+_TOKENIZE_LOCK = threading.RLock()
+
+
+def encode_text(tok, text, **kwargs):
+    """Tokenize `text` while holding the lock a shared fast tokenizer needs."""
+    with _TOKENIZE_LOCK:
+        return tok(text, **kwargs)
 
 
 def serialize_state(state: Union[str, dict, list]) -> str:
@@ -52,8 +68,16 @@ def render_options(q: Dict) -> List[str]:
     if t != "noul" and "labels" in q:
         raise ValueError("labels is only supported for noul questions")
     if t == "choice":
-        # only None/"" mean "no description"; 0 and False are legitimate criterion values
-        return [k if v is None or v == "" else "%s: %s" % (k, render_criterion(v)) for k, v in crit.items()]
+        # only None/"" mean "no description"; 0 and False are legitimate criterion values.
+        # `str(k)` unconditionally: a label with no description is rendered as itself, so an int
+        # label used to come back as an int from a function annotated `-> List[str]` and then
+        # reached `build_sequence`, which calls `.replace` on it and raised an AttributeError
+        # naming neither the question nor the label. With a description the same label already
+        # went through `"%s: %s" %` and was a str, which is why only the undescribed form broke.
+        # `structured._enum_field` stringifies labels the same way; the returned answer still
+        # carries the caller's original label, which is unchanged.
+        return [str(k) if v is None or v == "" else "%s: %s" % (k, render_criterion(v))
+                for k, v in crit.items()]
     if t == "score":
         return ["level %d: %s" % (i, render_criterion(c)) for i, c in enumerate(crit)]
     crit = crit or {}
@@ -75,19 +99,31 @@ def build_sequence(
     head_max_len: int = 192,
     option_order: Optional[List[int]] = None,
     truncate_left: bool = False,
+    state_ids: Optional[List[int]] = None,
 ):
-    """Format: [CLS] <type> instructions [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP]."""
+    """Format: [CLS] <type> instructions [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP].
+
+    `state_ids` lets a caller tokenize the shared state once and reuse it across every question,
+    instead of re-serializing and re-tokenizing the same document per question.
+    """
     mask_tok = tok.mask_token
     opts = render_options(q)
     order = option_order if option_order is not None else list(range(len(opts)))
     ins = str(q["ins"]).replace(mask_tok, " ")
-    head_ids = tok("%s question: %s" % (q["t"], ins), add_special_tokens=False)["input_ids"]
+    head_ids = encode_text(tok, "%s question: %s" % (q["t"], ins), add_special_tokens=False)["input_ids"]
     opt_ids = []
     for i in order:
-        opt_ids.append(
-            [tok.mask_token_id]
-            + tok(" " + opts[i].replace(mask_tok, " "), add_special_tokens=False)["input_ids"][:48]
-        )
+        # Cap at the tokenizer, not after the fact: `[:48]` still makes the tokenizer process the
+        # whole (possibly long) description. truncation=True, max_length=48 keeps the first 48
+        # tokens, which is exactly what the previous slice produced.
+        opt_tokens = encode_text(
+            tok,
+            " " + opts[i].replace(mask_tok, " "),
+            add_special_tokens=False,
+            truncation=True,
+            max_length=48,
+        )["input_ids"]
+        opt_ids.append([tok.mask_token_id] + opt_tokens)
     opt_budget = head_max_len - sum(len(o) for o in opt_ids)
     if opt_budget < 16:
         per = max(4, (head_max_len - 16) // max(1, len(opt_ids)))
@@ -101,9 +137,11 @@ def build_sequence(
         ids.extend(o)
     ids.append(tok.sep_token_id)
     room = max(0, max_len - len(ids) - 1)
-    st = tok(serialize_state(state).replace(mask_tok, " "), add_special_tokens=False)["input_ids"]
-    # not st[-room:]: with no room left, st[-0:] is the whole state rather than none of it
-    st = st[max(0, len(st) - room):] if truncate_left else st[:room]
+    if state_ids is None:
+        state_ids = encode_text(tok, serialize_state(state).replace(mask_tok, " "),
+                                add_special_tokens=False)["input_ids"]
+    # not state_ids[-room:]: with no room left, state_ids[-0:] is the whole state rather than none of it
+    st = state_ids[max(0, len(state_ids) - room):] if truncate_left else state_ids[:room]
     ids = ids + st + [tok.sep_token_id]
     return ids[:max_len], [m for m in markers if m < max_len]
 
@@ -111,17 +149,33 @@ def build_sequence(
 class DecisionModel(nn.Module):
     """Bidirectional transformer encoder backbone + typed decision head."""
 
-    def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1):
+    def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1,
+                 no_init: bool = False):
         super().__init__()
         self.encoder = encoder
         d = encoder.config.hidden_size
-        nhead = max(1, d // 64)
-        layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
-        self.head = nn.TransformerEncoder(layer, head_layers, enable_nested_tensor=False) if head_layers > 0 else None
-        self.type_emb = nn.Embedding(3, d)
-        self.scorer = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
-        self.act_head = nn.Sequential(nn.Linear(d + 4, 256), nn.GELU(), nn.Linear(256, n_act))
-        self.register_buffer("temperature", torch.ones(3))
+        # `no_init` means the caller is about to load every parameter from a checkpoint, so the
+        # head's initial values are pure overhead -- and not just time. transformers'
+        # `no_init_weights()` patches the torch.nn.init functions, but something inside
+        # nn.TransformerEncoderLayer draws from the RNG outside them, so building it still
+        # advanced the global generator and made `load()` a visible side effect. On the meta
+        # device no initialisation kernel runs at all; the layers are materialised empty and the
+        # load fills them.
+        with torch.device("meta") if no_init else nullcontext():
+            nhead = max(1, d // 64)
+            layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
+            self.head = nn.TransformerEncoder(layer, head_layers, enable_nested_tensor=False) if head_layers > 0 else None
+            self.type_emb = nn.Embedding(3, d)
+            self.scorer = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+            self.act_head = nn.Sequential(nn.Linear(d + 4, 256), nn.GELU(), nn.Linear(256, n_act))
+            self.register_buffer("temperature", torch.ones(3))
+        if no_init:
+            # Only the modules created above are on the meta device; the encoder is already real
+            # and may hold non-persistent buffers (RoPE frequencies) that to_empty would wipe.
+            for module in (self.head, self.type_emb, self.scorer, self.act_head):
+                if module is not None:
+                    module.to_empty(device="cpu")
+            self.temperature = torch.empty_like(self.temperature, device="cpu")
         self.head_checkpointing = False
 
     def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder: bool = False):
@@ -186,16 +240,39 @@ def _apply_rope_config(ecfg) -> None:
             setattr(ecfg, attr, float(theta))
 
 
-def build_model(cfg: Dict, encoder_dir: Optional[str] = None, pretrained: bool = True) -> DecisionModel:
+def _no_init_weights():
+    """`no_init_weights` lives in different modules across transformers versions."""
+    try:
+        from transformers.initialization import no_init_weights
+    except ImportError:  # transformers 4.x
+        from transformers.modeling_utils import no_init_weights
+    return no_init_weights()
+
+
+def build_model(cfg: Dict, encoder_dir: Optional[str] = None, pretrained: bool = True,
+                revision: Optional[str] = None) -> DecisionModel:
+    """Build the decision model described by `cfg`.
+
+    With `pretrained=False`, or when `encoder_dir` holds a saved encoder config, nothing is
+    downloaded and **no parameter is initialised**: the caller is expected to load a checkpoint
+    into the result with `load_state_dict(..., strict=True)` immediately. Skipping initialisation
+    keeps `load()` from spending time on, or consuming RNG for, weights it is about to overwrite.
+    """
     from transformers import AutoConfig, AutoModel
 
+    head_layers, n_act = cfg.get("head_layers", 2), len(cfg.get("act_costs", {})) + 1
     if not pretrained or (encoder_dir and os.path.exists(encoder_dir)):
         ecfg = AutoConfig.from_pretrained(encoder_dir or cfg["encoder"])
         _apply_rope_config(ecfg)
-        enc = AutoModel.from_config(ecfg, attn_implementation="sdpa")
-    else:
-        enc = AutoModel.from_pretrained(cfg["encoder"], attn_implementation="sdpa")
-    return DecisionModel(enc, cfg.get("head_layers", 2), len(cfg.get("act_costs", {})) + 1)
+        with _no_init_weights():
+            enc = AutoModel.from_config(ecfg, attn_implementation="sdpa")
+        return DecisionModel(enc, head_layers, n_act, no_init=True)
+    # Training-time Hub load of the base encoder; allow pinning it like the checkpoints.
+    kw = {"attn_implementation": "sdpa"}
+    if revision:
+        kw["revision"] = revision
+    enc = AutoModel.from_pretrained(cfg["encoder"], **kw)
+    return DecisionModel(enc, head_layers, n_act)
 
 
 def proper_reward(
@@ -258,8 +335,28 @@ def ece_score(conf: np.ndarray, correct: np.ndarray, bins: int = 15) -> float:
     return float(e)
 
 
+def answer_confidence(p: np.ndarray, k: int) -> float:
+    """Probability mass on the answer being reported: max(p).
+
+    This is the quantity temperature scaling fits, and the quantity every calibration figure in
+    this repository is computed on -- both benchmark harnesses take `conf = max(probs)` before
+    calling `ece_score`. It is therefore the one confidence with the property the README's
+    gating section relies on: of the answers returned at confidence c, about c of them are right.
+
+    `confidence_from_probs` below reports a different quantity on a different scale and carries
+    no such guarantee, so the two must not be compared against the same threshold.
+    """
+    if k < 1:
+        return 1.0
+    return float(np.clip(np.max(p[:k]), 0.0, 1.0))
+
+
 def confidence_from_probs(p: np.ndarray, k: int) -> float:
-    """Normalized Shannon entropy confidence: 1 - H(p) / log(k)."""
+    """Normalized Shannon entropy confidence: 1 - H(p) / log(k).
+
+    How concentrated the whole distribution is. Useful, but not calibrated: it is not what
+    temperature scaling fits and not what the reported ECE measures. See `answer_confidence`.
+    """
     if k < 2:
         return 1.0
     p = p[:k]
@@ -315,13 +412,15 @@ def collate_items(batch, pad_id: int):
         mpos[i, :k] = torch.tensor(it["markers"])
         mmask[i, :k] = True
         if has_target and "target" in it:
-            if len(it["target"]) > kmax:
+            if len(it["target"]) > k:
                 # Otherwise this lands as "The expanded size of the tensor (k) must match the
                 # existing size (kmax)" from inside the assignment, which says nothing about the
-                # actual mistake: a target with more entries than the item has options.
+                # actual mistake: a target with more entries than the item has options. The limit
+                # is this item's own marker count, not the batch-wide kmax: in a mixed-width
+                # batch a longer sibling row must not legitimise extra entries (#311).
                 raise ValueError(
                     "collate_items: item %d has %d target entries but only %d marker positions; "
-                    "a target needs one entry per option" % (i, len(it["target"]), kmax))
+                    "a target needs one entry per option" % (i, len(it["target"]), k))
             target[i, : len(it["target"])] = torch.tensor(it["target"], dtype=torch.float32)
 
     res = {

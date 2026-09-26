@@ -1,7 +1,7 @@
 """Laya: Fast, non-autoregressive System 1 decision engine with calibrated probabilities."""
 
 from .email import clean_email_body, email_state
-from .hooks import Hook, PredictContext, PredictHook
+from .hooks import AsyncHook, BaseHook, Hook, PredictContext, PredictHook
 from .lang import analyse as detect_language
 from .lang import detect_script, is_english
 from .presets import (
@@ -12,8 +12,9 @@ from .presets import (
     triage_questions,
 )
 from .router import DEFAULT_MODELS, RouteDecision, Router
+from .structured import DecisionResult, decide
 
-__version__ = "0.3.11"
+__version__ = "0.3.20"
 
 # Routing, language detection and email cleaning are pure Python. The torch-backed names are
 # resolved lazily so that `import laya` -- and therefore `from laya import Router` or
@@ -25,6 +26,7 @@ _LAZY_ATTRS = {
     "proper_reward": (".common", "proper_reward"),
     "td_lambda_targets": (".common", "td_lambda_targets"),
     "ece_score": (".common", "ece_score"),
+    "answer_confidence": (".common", "answer_confidence"),
     "confidence_from_probs": (".common", "confidence_from_probs"),
     "render_options": (".common", "render_options"),
     "QTYPES": (".common", "QTYPES"),
@@ -32,6 +34,7 @@ _LAZY_ATTRS = {
     "shortlist_choice": (".shortlist", "shortlist_choice"),
     "predict_shortlist": (".shortlist", "predict_shortlist"),
     "embed_fn_from_agent": (".shortlist", "embed_fn_from_agent"),
+    "cached_embed_fn": (".shortlist", "cached_embed_fn"),
     "LayaRouter": (".integrations", "LayaRouter"),
     "LayaGuardrail": (".integrations", "LayaGuardrail"),
     "LayaGuardrailError": (".integrations", "LayaGuardrailError"),
@@ -66,6 +69,7 @@ __all__ = [
     "shortlist_choice",
     "predict_shortlist",
     "embed_fn_from_agent",
+    "cached_embed_fn",
     "detect_language",
     "detect_script",
     "is_english",
@@ -79,6 +83,7 @@ __all__ = [
     "proper_reward",
     "td_lambda_targets",
     "ece_score",
+    "answer_confidence",
     "confidence_from_probs",
     "render_options",
     "QTYPES",
@@ -91,5 +96,9 @@ __all__ = [
     "PredictContext",
     "PredictHook",
     "Hook",
+    "BaseHook",
+    "AsyncHook",
+    "decide",
+    "DecisionResult",
     "__version__",
 ]

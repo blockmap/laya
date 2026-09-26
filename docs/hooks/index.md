@@ -54,7 +54,15 @@ with agent.hooks_installed(debug):   # installed for the block, removed on exit
     agent.system_one(state, questions)
 ```
 
-See [runtime registration](api.md#runtime-registration).
+See [runtime registration](api.md#runtime-registration). For a hook that should apply everywhere
+without threading it through every call, register it once with
+[process-wide defaults](api.md#process-wide-defaults):
+
+```python
+from laya import hooks
+
+hooks.set_default_hooks(hooks=[Tracer()])
+```
 
 ## The mental model
 
@@ -116,8 +124,12 @@ automatically. `Agent` hooks fire whenever the Router runs an attached or built 
 - No hooks configured means no behavioural change. The unset path is regression-tested.
 - All hook parameters are keyword arguments with defaults, so existing calls keep working.
 - `laya/hooks.py` is pure Python: `import laya` does not pull in torch because of it.
-- Hooks are synchronous. Keep them fast and non-blocking; see
-  [errors](errors.md) and [patterns](patterns.md) for the consequences on `laya.serve`.
+- Hooks are synchronous by default. An `async def` event can be wrapped in
+  [`AsyncHook`](api.md#async-hooks), or passed as a plain async callable, and it runs to
+  completion for you.
+- [`hooks_timeout`](errors.md#timeouts) bounds a slow hook so it cannot hang a served request.
+- Keep hooks fast and non-blocking; see [errors](errors.md) and [patterns](patterns.md) for the
+  consequences on `laya.serve`.
 
 ## See also
 

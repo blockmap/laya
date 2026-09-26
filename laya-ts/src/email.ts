@@ -5,18 +5,51 @@ const QUOTE_HEADERS: RegExp[] = [
   /^\s*-{2,}\s*(Original|Forwarded) Message\s*-{2,}/i,
   /^\s*-{2,}\s*(Mensagem (original|encaminhada)|Mensaje (original|reenviado))\s*-{2,}/i,
   /^\s*_{8,}\s*$/,
-  /^\s*From:\s.+$/i,
+  // `From:` opens ordinary prose too ("From: my side the integration works, but please
+  // refund..."), and a reply header always carries the sender, so the header is only recognised
+  // when an address follows -- the same rule as `De:` below. A bare `From: Name` header is
+  // caught by HEADER_FROM_NAME/HEADER_NEXT instead, which need the header's own `Sent:`/`Date:`
+  // line to tell it apart from a sentence.
+  /^\s*From:\s.*[@<]/i,
+  // `De:` also opens ordinary Portuguese/Spanish lines ("De: 10/09 a 15/09"), so the Outlook
+  // header is only recognised when it carries an address
   /^\s*De:\s.*[@<]/i,
 ];
 const ATTRIBUTION_TAIL = /^.{0,120}\S@\S+\s+(wrote|escreveu|escribi[óo]):\s*$/i;
 const ATTRIBUTION_HEAD = /^\s*(On|Em|El) (?=.*\d)/i;
-const HEADER_FROM_NAME = /^\s*De:\s+\S/i;
-const HEADER_NEXT = /^\s*(Enviad[oa]( em| el)?:\s|(Data|Fecha):\s.*\d{4})/i;
-const SIGNATURE_MARKERS: RegExp[] = [
-  /^\s*--\s*$/,
-  /^\s*(best|kind|warm|many thanks|thanks|thank you|regards|cheers|sincerely)[\w ,!.]*$/i,
-  /^\s*sent from my (iphone|android|mobile|ipad)/i,
-  /^\s*(atenciosamente|att|abraços?|abs|um abraço|cordialmente|grat[oa]|(muito )?obrigad[oa]s?( desde já| pela atenção)?|(com os melhores )?cumprimentos|saudações|(un )?saludos?( cordiales)?|atentamente|(muchas )?gracias( de antemano)?)[\s,!.]*$/i,
+// Exchange often leaves the address out of Outlook's reply header ("De: Maria Souza"), so a bare
+// `De:` only cuts when the header's own `Enviado:` line, or a dated `Data:`/`Fecha:` line, follows
+// it. `Para:` is not enough: "De: 10/09 / Para: 15/09" is how a leave request reads.
+//
+// The same is true of a bare English `From: Maria Souza`, which is why the marker above needs
+// this rule: the English client lines are the translations of the two `De:` neighbours. A line
+// that only looks like prose still has to be told apart from a header by its neighbours, so the
+// English pair is "From: <name>" followed by "Sent:"/"Date:".
+const HEADER_FROM_NAME = /^\s*(De|From):\s+\S/i;
+const HEADER_NEXT = /^\s*(Enviad[oa]( em| el)?:\s|Sent:\s|(Data|Fecha|Date):\s.*\d{4})/i;
+// A closing line is the closing word plus punctuation and at most a name. Anything else on
+// the line is a sentence, and the case of the next word is what separates the two: a name is
+// capitalised, "for" in "Thanks for the quick reply." is not. JS regexes have no scoped
+// case-insensitive groups like Python's (?i:...), so the closing words are matched
+// case-insensitively here and the name is checked case-sensitively by SIGNOFF_TAIL.
+const SIGNOFF_HEAD =
+  /^\s*(?:best|kind|warmest|warm|many thanks|thanks|thank you|regards|cheers|sincerely)(?:\s+(?:and|&)\s+regards|\s+(?:regards|wishes|again|in advance|a lot|so much|very much))?/i;
+// Python's name class [^\W\d_a-zß-öø-ÿ] is "a word char that is not a digit, underscore or
+// lowercase letter"; \p{Lu}/\p{Lt}/\p{Lo} is the same intent: a name is capitalised in any
+// script (Regards, Łukasz) or written in a script without case (山田).
+const SIGNOFF_TAIL = /^[\s,;:!.]*(?:[\p{Lu}\p{Lt}\p{Lo}][\p{L}\p{M}\p{N}_'-]*[\s,.]*){0,3}$/u;
+function isEnglishSignoff(line: string): boolean {
+  const m = SIGNOFF_HEAD.exec(line);
+  return m !== null && SIGNOFF_TAIL.test(line.slice(m[0].length));
+}
+const SIGNATURE_MARKERS: Array<(line: string) => boolean> = [
+  (l) => /^\s*--\s*$/.test(l),
+  isEnglishSignoff,
+  (l) => /^\s*sent from my (iphone|android|mobile|ipad)/i.test(l),
+  (l) =>
+    /^\s*(atenciosamente|att|abraços?|abs|um abraço|cordialmente|grat[oa]|(muito )?obrigad[oa]s?( desde já| pela atenção)?|(com os melhores )?cumprimentos|saudações|(un )?saludos?( cordiales)?|atentamente|(muchas )?gracias( de antemano)?)[\s,!.]*$/i.test(
+      l,
+    ),
 ];
 const DEVICE =
   "iphone|ipad|android|ios|celular|telemóvel|móvil|galaxy|smartphone|samsung|tablet|" +
@@ -27,7 +60,15 @@ const DEVICE_FOOTER = new RegExp(
   "i",
 );
 const DISCLAIMER = new RegExp(
-  "(confidential|intended (solely )?for the (use of the )?(named )?(addressee|recipient)|" +
+  // English is tied to a disclaimer noun and a disclaimer tail, the way the Portuguese branches
+  // below are. The bare word matched any sentence that merely mentioned it, so "Is this
+  // confidential?" and "Confidential: I need a refund." were deleted whole and the model was
+  // scored on an empty state. `[^.]` rather than `[^.\n]`: a footer wraps, so "are\nconfidential"
+  // must still match.
+  "(\\b(e-?mail|message|information|communication|transmission|contents?)\\b[^.]{0,60}" +
+    "\\bconfidential\\b[^.]{0,60}\\b(intended|solely|addressee|recipient|privileged|" +
+    "disclos|unauthori[sz]ed)|" +
+    "\\bconfidential\\b[^.]{0,60}\\b(and (may|is) (also )?privileged)|" +
     "if you (have )?received this (e-?mail|message) in error|" +
     "\\b(esta|este) (mensagem|e-?mail|mensaje|correo)\\b[^.]{0,80}(confidencia|sigilos|privilegiad)|" +
     "\\b(uso exclusivo|exclusivamente|únicamente|unicamente)\\b[^.]{0,30}" +
@@ -76,7 +117,10 @@ function stripDisclaimer(paragraph: string): string {
 }
 
 export function cleanEmailBody(body: string, maxChars = 3000): string {
-  const text = (body ?? "").replace(/\r\n?/g, "\n").replace(/\\n/g, "\n");
+  let text = (body ?? "").replace(/\r\n?/g, "\n").replace(/\\n/g, "\n");
+  // Bound regex work before the expensive patterns below (Python does the same): only
+  // maxChars are ever returned, so nothing past 4x can survive cleaning.
+  if (text.length > maxChars * 4) text = text.slice(0, maxChars * 4);
   const lines: string[] = [];
   const src = text.split("\n");
   for (let i = 0; i < src.length; i++) {
@@ -95,7 +139,7 @@ export function cleanEmailBody(body: string, maxChars = 3000): string {
   for (let i = start; i < lines.length; i++) {
     const n = lines[i].trim().length;
     if (
-      (n <= 40 && SIGNATURE_MARKERS.some((p) => p.test(lines[i]))) ||
+      (n <= 40 && SIGNATURE_MARKERS.some((p) => p(lines[i]))) ||
       (n <= 60 && DEVICE_FOOTER.test(lines[i]))
     ) {
       cut = i;
